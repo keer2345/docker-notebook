@@ -323,3 +323,141 @@ root@34d677d77824:/opt/flask-app# exit
 There are still two problems with this approach -
 1. How do we tell the Flask container that es hostname stands for 172.17.0.2 or some other IP since the IP can change?
 1. Since the bridge network is shared by every container by default, this method is not secure. How do we isolate our network?
+
+
+Let's first go ahead and create our own network.
+```
+$ docker network create foodtrucks-net
+0815b2a3bb7a6608e850d05553cc0bda98187c4528d94621438f31d97a6fea3c
+
+$ docker network ls
+NETWORK ID          NAME                DRIVER              SCOPE
+c2c695315b3a        bridge              bridge              local
+0815b2a3bb7a        foodtrucks-net      bridge              local
+a875bec5d6fd        host                host                local
+ead0e804a67b        none                null                local
+```
+Now that we have a network, we can launch our containers inside this network using the `--net` flag. Let's do that - but first, we will stop and delete our ES container that is running in the bridge (default) network.
+```
+$ docker container stop es
+es
+
+$ docker rm es
+es
+
+$ docker run -d --name es --net foodtrucks-net -p 9200:9200 -p 9300:9300 -e "discovery.type=single-node" docker.elastic.co/elasticsearch/elasticsearch:6.3.2
+13d6415f73c8d88bddb1f236f584b63dbaf2c3051f09863a3f1ba219edba3673
+
+$ docker network inspect foodtrucks-net
+[
+    {
+        "Name": "foodtrucks-net",
+        "Id": "0815b2a3bb7a6608e850d05553cc0bda98187c4528d94621438f31d97a6fea3c",
+        "Created": "2018-07-30T00:01:29.1500984Z",
+        "Scope": "local",
+        "Driver": "bridge",
+        "EnableIPv6": false,
+        "IPAM": {
+            "Driver": "default",
+            "Options": {},
+            "Config": [
+                {
+                    "Subnet": "172.18.0.0/16",
+                    "Gateway": "172.18.0.1"
+                }
+            ]
+        },
+        "Internal": false,
+        "Attachable": false,
+        "Ingress": false,
+        "ConfigFrom": {
+            "Network": ""
+        },
+        "ConfigOnly": false,
+        "Containers": {
+            "13d6415f73c8d88bddb1f236f584b63dbaf2c3051f09863a3f1ba219edba3673": {
+                "Name": "es",
+                "EndpointID": "29ba2d33f9713e57eb6b38db41d656e4ee2c53e4a2f7cf636bdca0ec59cd3aa7",
+                "MacAddress": "02:42:ac:12:00:02",
+                "IPv4Address": "172.18.0.2/16",
+                "IPv6Address": ""
+            }
+        },
+        "Options": {},
+        "Labels": {}
+    }
+]
+```
+
+As you can see, our `es` container is now running inside the `foodtrucks-net` bridge network. Now let's inspect what happens when we launch in our `foodtrucks-net` network.
+```
+$ docker run -it --rm --net foodtrucks-net keer2345/foodtrucks-web bash
+root@9d2722cf282c:/opt/flask-app# curl es:9200
+{
+  "name" : "wWALl9M",
+  "cluster_name" : "docker-cluster",
+  "cluster_uuid" : "BA36XuOiRPaghPNBLBHleQ",
+  "version" : {
+    "number" : "6.3.2",
+    "build_flavor" : "default",
+    "build_type" : "tar",
+    "build_hash" : "053779d",
+    "build_date" : "2018-07-20T05:20:23.451332Z",
+    "build_snapshot" : false,
+    "lucene_version" : "7.3.1",
+    "minimum_wire_compatibility_version" : "5.6.0",
+    "minimum_index_compatibility_version" : "5.0.0"
+  },
+  "tagline" : "You Know, for Search"
+}
+root@53af252b771a:/opt/flask-app# ls
+app.py  node_modules  package.json  requirements.txt  static  templates  webpack.config.js
+root@53af252b771a:/opt/flask-app# python app.py
+Index not found...
+Loading data in elasticsearch ...
+Total trucks loaded:  733
+ * Running on http://0.0.0.0:5000/ (Press CTRL+C to quit)
+root@53af252b771a:/opt/flask-app# exit
+```
+Wohoo! That works! On user-defined networks like foodtrucks-net, containers can not only communicate by IP address, but can also resolve a container name to an IP address. This capability is called automatic service discovery. Great! Let's launch our Flask container for real now :
+```
+$ docker run -d --net foodtrucks-net -p 5000:5000 --name foodtrucks-web keer2345/foodtrucks-web
+852fc74de2954bb72471b858dce64d764181dca0cf7693fed201d76da33df794
+
+$ docker container ls
+CONTAINER ID        IMAGE                                                 COMMAND                  CREATED              STATUS              PORTS                                            NAMES
+852fc74de295        keer2345/foodtrucks-web                            "python ./app.py"        About a minute ago   Up About a minute   0.0.0.0:5000->5000/tcp                           foodtrucks-web
+13d6415f73c8        docker.elastic.co/elasticsearch/elasticsearch:6.3.2   "/usr/local/bin/dock…"   17 minutes ago       Up 17 minutes       0.0.0.0:9200->9200/tcp, 0.0.0.0:9300->9300/tcp   es
+
+$ curl -I 0.0.0.0:5000
+HTTP/1.0 200 OK
+Content-Type: text/html; charset=utf-8
+Content-Length: 3697
+Server: Werkzeug/0.11.2 Python/2.7.6
+Date: Sun, 10 Jan 2016 23:58:53 GMT
+```
+Although that might have seemed like a lot of work, we actually just typed 4 commands to go from zero to running. I've collated the commands in a [bash script](https://github.com/prakhar1989/FoodTrucks/blob/master/setup-docker.sh).
+```
+#!/bin/bash
+
+# build the flask container
+docker build -t keer2345/foodtrucks-web .
+
+# create the network
+docker network create foodtrucks-net
+
+# start the ES container
+docker run -d --name es --net foodtrucks-net -p 9200:9200 -p 9300:9300 -e "discovery.type=single-node" docker.elastic.co/elasticsearch/elasticsearch:6.3.2
+
+# start the flask app container
+docker run -d --net foodtrucks-net -p 5000:5000 --name foodtrucks-web keer2345/foodtrucks-web
+```
+Now imagine you are distributing your app to a friend, or running on a server that has docker installed. You can get a whole app running with just one command!
+```
+$ git clone https://github.com/prakhar1989/FoodTrucks
+$ cd FoodTrucks
+$ ./setup-docker.sh
+```
+And that's it! If you ask me, I find this to be an extremely awesome, and a powerful way of sharing and running your applications!
+
+## Docker Compose
